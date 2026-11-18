@@ -1,25 +1,179 @@
 #!/usr/bin/env python3
-"""Capture Prometheus Alertmanager webhook payloads and print them.
+"""Receive Alertmanager webhooks and print a Cursor diagnosis.
 
-Alertmanager posts JSON to the receiver URL. This server accepts that body
-on POST / (any path is accepted) and writes it to stdout.
+Each POST is acknowledged immediately, then a local Cursor agent inspects the
+bankobs namespace with read-only kubectl and the diagnosis is printed.
 
-Run:
-    python webhook.py
-    python webhook.py --host 0.0.0.0 --port 8080
-
-Point Alertmanager at it:
-
-    receivers:
-      - name: ai-analyzer
-        webhook_configs:
-          - url: http://<this-host>:8080/
-            send_resolved: true
+    pip install -r requirements.txt
+    export CURSOR_API_KEY='cursor_...'
+    python3.11 webhook.py
+    python3.11 webhook.py --api-key "$CURSOR_API_KEY" --model composer-2.5
 """
 
 import argparse
 import json
+import os
+import queue
+import subprocess
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from cursor_sdk import (
+    Agent,
+    AgentOptions,
+    CursorAgentError,
+    CustomTool,
+    CustomToolContext,
+    LocalAgentOptions,
+)
+
+KUBE_CONTEXT = "obs-v1-bankobs"
+KUBE_NAMESPACE = "bankobs"
+ALLOWED_VERBS = {"get", "describe", "logs", "top", "api-resources", "explain"}
+CLUSTER_VERBS = {"api-resources", "explain"}
+KUBECTL_TIMEOUT_SECONDS = 45
+OUTPUT_LIMIT = 20000
+
+jobs = queue.Queue()
+print_lock = threading.Lock()
+settings = {}
+
+
+def emit(text):
+    with print_lock:
+        print(text, flush=True)
+
+
+def run_kubectl(args, _context: CustomToolContext):
+    """Run a read-only kubectl command in the bankobs namespace."""
+    argv = args.get("args")
+    if not isinstance(argv, list) or not argv or not all(isinstance(part, str) for part in argv):
+        return 'args must be a list of strings, for example ["get", "pods"]'
+
+    verb = argv[0]
+    if verb not in ALLOWED_VERBS:
+        allowed = ", ".join(sorted(ALLOWED_VERBS))
+        return f"rejected: {verb!r} is not allowed. Use one of: {allowed}"
+
+    cleaned = []
+    skip_next = False
+    for part in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if part in ("--context", "-n", "--namespace"):
+            skip_next = True
+            continue
+        if part.startswith(("--context=", "--namespace=", "-n=")):
+            continue
+        cleaned.append(part)
+
+    command = ["kubectl", "--context", KUBE_CONTEXT]
+    if verb not in CLUSTER_VERBS:
+        command.extend(["-n", KUBE_NAMESPACE])
+    command.extend(cleaned)
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=KUBECTL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"kubectl timed out after {KUBECTL_TIMEOUT_SECONDS}s: {' '.join(command)}"
+    except OSError as err:
+        return f"kubectl could not start: {err}"
+
+    output = (completed.stdout or "") + (completed.stderr or "")
+    if len(output) > OUTPUT_LIMIT:
+        output = output[:OUTPUT_LIMIT] + "\n...[truncated]"
+    header = f"$ {' '.join(command)}\nexit {completed.returncode}\n"
+    return header + (output or "(no output)")
+
+
+KUBECTL_TOOL = CustomTool(
+    description=(
+        "Run a read-only kubectl command. Context is always obs-v1-bankobs and "
+        "the namespace is always bankobs. args is the kubectl argument list "
+        'without context or namespace, for example ["get", "pods"] or '
+        '["describe", "pod", "payments-0"] or ["logs", "payments-0", "--tail=100"].'
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "args": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "kubectl arguments, starting with the verb",
+            }
+        },
+        "required": ["args"],
+    },
+    execute=run_kubectl,
+)
+
+
+def alert_names(payload):
+    names = []
+    for alert in payload.get("alerts") or []:
+        labels = alert.get("labels") or {}
+        name = labels.get("alertname") or "unknown"
+        status = alert.get("status") or payload.get("status") or ""
+        names.append(f"{name} ({status})" if status else name)
+    return names or ["(no alerts)"]
+
+
+def analyze(payload):
+    names = ", ".join(alert_names(payload))
+    emit(f"\n{'=' * 60}\nAnalyzing {names}\nreceiver={payload.get('receiver')} status={payload.get('status')}")
+    prompt = (
+        "A Prometheus Alertmanager webhook just arrived. Diagnose what is wrong "
+        f"in Kubernetes context {KUBE_CONTEXT}, namespace {KUBE_NAMESPACE}.\n"
+        "Use the kubectl tool to inspect current pods, events, and logs that "
+        "match this alert. Do not change the cluster. Base the conclusion on "
+        "command output.\n"
+        "If this alert is not about a workload in that namespace, say so after "
+        "checking, and report what the namespace actually shows.\n"
+        "Reply with what is wrong: the alert, the observed cluster state, and "
+        "the most likely cause. Keep it short.\n\n"
+        "Webhook payload:\n"
+        f"{json.dumps(payload, indent=2, sort_keys=True)}"
+    )
+    try:
+        result = Agent.prompt(
+            prompt,
+            AgentOptions(
+                api_key=settings["api_key"],
+                model=settings["model"],
+                tools=[],
+                local=LocalAgentOptions(
+                    cwd=os.getcwd(),
+                    custom_tools={"kubectl": KUBECTL_TOOL},
+                ),
+            ),
+        )
+    except CursorAgentError as err:
+        emit(f"Cursor could not start: {err.message} (retryable={err.is_retryable})")
+        return
+
+    if result.status != "finished":
+        emit(f"Analysis failed ({result.status}).\n{result.result or ''}".rstrip())
+        return
+    emit(result.result or "(Cursor returned an empty analysis)")
+    emit("=" * 60)
+
+
+def worker():
+    while True:
+        payload = jobs.get()
+        try:
+            analyze(payload)
+        except Exception as err:
+            emit(f"Analysis error: {err}")
+        finally:
+            jobs.task_done()
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -27,32 +181,25 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self._send(200, {"status": "ok"})
 
     def do_POST(self):
-        self._capture()
+        self._accept()
 
     def do_PUT(self):
-        self._capture()
+        self._accept()
 
-    def _capture(self):
+    def _accept(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length) if length else b""
-        text = raw.decode("utf-8", errors="replace")
-
-        print("=" * 60, flush=True)
-        print(f"{self.command} {self.path}", flush=True)
-        for key, value in self.headers.items():
-            print(f"{key}: {value}", flush=True)
-        print("-" * 60, flush=True)
-        if not text:
-            print("(empty body)", flush=True)
-        else:
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                print(text, flush=True)
-            else:
-                print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
-        print("=" * 60, flush=True)
-
+        try:
+            payload = json.loads(raw.decode("utf-8") or "null")
+        except json.JSONDecodeError:
+            emit("Ignored webhook: body is not JSON")
+            self._send(400, {"status": "invalid json"})
+            return
+        if not isinstance(payload, dict):
+            emit("Ignored webhook: JSON body is not an object")
+            self._send(400, {"status": "invalid payload"})
+            return
+        jobs.put(payload)
         self._send(200, {"status": "received"})
 
     def _send(self, code, body):
@@ -68,17 +215,29 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Print Alertmanager webhook payloads")
+    parser = argparse.ArgumentParser(description="Diagnose Alertmanager webhooks with Cursor")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--api-key", default=os.environ.get("CURSOR_API_KEY", ""))
+    parser.add_argument("--model", default=os.environ.get("CURSOR_MODEL", "composer-2.5"))
     args = parser.parse_args()
 
+    if not args.api_key.strip():
+        raise SystemExit("Set CURSOR_API_KEY or pass --api-key")
+
+    settings["api_key"] = args.api_key.strip()
+    settings["model"] = args.model
+    threading.Thread(target=worker, daemon=True).start()
+
     server = ThreadingHTTPServer((args.host, args.port), WebhookHandler)
-    print(f"Listening on http://{args.host}:{args.port}/", flush=True)
+    emit(
+        f"Listening on http://{args.host}:{args.port}/ "
+        f"(kubectl --context {KUBE_CONTEXT} -n {KUBE_NAMESPACE}, model {args.model})"
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopping", flush=True)
+        emit("\nStopping")
     finally:
         server.server_close()
 
