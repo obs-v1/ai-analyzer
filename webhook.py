@@ -129,7 +129,16 @@ def alert_names(payload):
 
 def analyze(payload):
     names = ", ".join(alert_names(payload))
-    emit(f"\n{'=' * 60}\nAnalyzing {names}\nreceiver={payload.get('receiver')} status={payload.get('status')}")
+    body = json.dumps(payload, indent=2, sort_keys=True)
+    emit(
+        f"\n{'=' * 60}\n"
+        f"ALERT PAYLOAD  {names}\n"
+        f"receiver={payload.get('receiver')} status={payload.get('status')}\n"
+        f"{'-' * 60}\n"
+        f"{body}\n"
+        f"{'-' * 60}\n"
+        "Analysis running"
+    )
     prompt = (
         "A Prometheus Alertmanager webhook just arrived. Diagnose what is wrong "
         f"in Kubernetes context {KUBE_CONTEXT}, namespace {KUBE_NAMESPACE}.\n"
@@ -167,8 +176,8 @@ def analyze(payload):
         code = f" {result.error_code}" if result.error_code else ""
         emit(f"Analysis failed ({result.status}{code}).\n{detail}".rstrip())
         return
-    emit(result.result or "(Cursor returned an empty analysis)")
-    emit("=" * 60)
+    report = result.result or "(Cursor returned an empty analysis)"
+    emit(f"ANALYSIS REPORT  {names}\n{'-' * 60}\n{report}\n{'=' * 60}")
 
 
 def worker():
@@ -206,6 +215,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send(400, {"status": "invalid payload"})
             return
         jobs.put(payload)
+        emit(f"Received {', '.join(alert_names(payload))} — queued")
         self._send(200, {"status": "received"})
 
     def _send(self, code, body):
