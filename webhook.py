@@ -21,10 +21,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from cursor_sdk import (
     Agent,
     AgentOptions,
+    Cursor,
     CursorAgentError,
     CustomTool,
     CustomToolContext,
     LocalAgentOptions,
+    ModelSelection,
 )
 
 KUBE_CONTEXT = "obs-v1-bankobs"
@@ -131,9 +133,12 @@ def analyze(payload):
     prompt = (
         "A Prometheus Alertmanager webhook just arrived. Diagnose what is wrong "
         f"in Kubernetes context {KUBE_CONTEXT}, namespace {KUBE_NAMESPACE}.\n"
-        "Use the kubectl tool to inspect current pods, events, and logs that "
-        "match this alert. Do not change the cluster. Base the conclusion on "
-        "command output.\n"
+        "You must run kubectl before you answer. Prefer the kubectl tool. "
+        "If you use the shell instead, the command must start with "
+        f"kubectl --context {KUBE_CONTEXT} -n {KUBE_NAMESPACE}. "
+        "Only read the cluster: get, describe, logs, top. "
+        "Do not create, delete, or change anything. "
+        "Base the conclusion on command output.\n"
         "If this alert is not about a workload in that namespace, say so after "
         "checking, and report what the namespace actually shows.\n"
         "Reply with what is wrong: the alert, the observed cluster state, and "
@@ -147,7 +152,6 @@ def analyze(payload):
             AgentOptions(
                 api_key=settings["api_key"],
                 model=settings["model"],
-                tools=[],
                 local=LocalAgentOptions(
                     cwd=os.getcwd(),
                     custom_tools={"kubectl": KUBECTL_TOOL},
@@ -159,7 +163,9 @@ def analyze(payload):
         return
 
     if result.status != "finished":
-        emit(f"Analysis failed ({result.status}).\n{result.result or ''}".rstrip())
+        detail = result.error_message or result.result or ""
+        code = f" {result.error_code}" if result.error_code else ""
+        emit(f"Analysis failed ({result.status}{code}).\n{detail}".rstrip())
         return
     emit(result.result or "(Cursor returned an empty analysis)")
     emit("=" * 60)
@@ -214,6 +220,25 @@ class WebhookHandler(BaseHTTPRequestHandler):
         return
 
 
+def resolve_model(model_id, api_key):
+    """Use the account's default variant. Plus rejects a bare model id."""
+    try:
+        catalog = Cursor.models.list(api_key=api_key)
+    except CursorAgentError as err:
+        emit(f"Could not list models ({err.message}); using {model_id} as given")
+        return model_id
+    for model in catalog:
+        if model.id != model_id:
+            continue
+        for variant in model.variants:
+            if variant.is_default and variant.params:
+                return ModelSelection(id=model.id, params=list(variant.params))
+        return model.id
+    known = ", ".join(model.id for model in catalog) or "(none)"
+    emit(f"Model {model_id} is not in this account's catalog ({known})")
+    return model_id
+
+
 def main():
     parser = argparse.ArgumentParser(description="Diagnose Alertmanager webhooks with Cursor")
     parser.add_argument("--host", default="0.0.0.0")
@@ -226,13 +251,19 @@ def main():
         raise SystemExit("Set CURSOR_API_KEY or pass --api-key")
 
     settings["api_key"] = args.api_key.strip()
-    settings["model"] = args.model
+    settings["model"] = resolve_model(args.model, settings["api_key"])
     threading.Thread(target=worker, daemon=True).start()
 
     server = ThreadingHTTPServer((args.host, args.port), WebhookHandler)
+    chosen = settings["model"]
+    if isinstance(chosen, ModelSelection):
+        params = ", ".join(f"{param.id}={param.value}" for param in chosen.params)
+        model_label = f"{chosen.id} ({params})" if params else chosen.id
+    else:
+        model_label = str(chosen)
     emit(
         f"Listening on http://{args.host}:{args.port}/ "
-        f"(kubectl --context {KUBE_CONTEXT} -n {KUBE_NAMESPACE}, model {args.model})"
+        f"(kubectl --context {KUBE_CONTEXT} -n {KUBE_NAMESPACE}, model {model_label})"
     )
     try:
         server.serve_forever()
