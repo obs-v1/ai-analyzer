@@ -39,11 +39,19 @@ OUTPUT_LIMIT = 20000
 jobs = queue.Queue()
 print_lock = threading.Lock()
 settings = {}
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webhook.log")
+log_file = None
 
 
 def emit(text):
+    """Print and append the same line to webhook.log."""
+    global log_file
     with print_lock:
         print(text, flush=True)
+        if log_file is None:
+            log_file = open(LOG_PATH, "a", buffering=1, encoding="utf-8")
+        log_file.write(text + "\n")
+        log_file.flush()
 
 
 def run_kubectl(args, _context: CustomToolContext):
@@ -275,6 +283,7 @@ def main():
         f"Listening on http://{args.host}:{args.port}/ "
         f"(kubectl --context {KUBE_CONTEXT} -n {KUBE_NAMESPACE}, model {model_label})"
     )
+    emit(f"Logging to {LOG_PATH}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
